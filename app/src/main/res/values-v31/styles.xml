@@ -5,7 +5,9 @@
         <item name="android:colorAccent">#5B76D8</item>
         <item name="android:navigationBarColor">@color/enpl_start_bg</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowSplashScreenBackground">@color/enpl_start_bg</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_transparent</item>
+        <item name="android:windowSplashScreenAnimationDuration">0</item>
         <item name="android:windowBackground">@color/enpl_start_bg</item>
     </style>
 </resources>

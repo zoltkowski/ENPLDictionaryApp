@@ -1,19 +1,27 @@
 package app.enpl.dictionary
 
 import android.content.ContentResolver
+import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.channels.FileChannel
+import java.security.MessageDigest
 import java.util.Locale
 
 internal class StarDictDictionary(
+    context: Context,
     private val resolver: ContentResolver,
+    val id: String,
     val title: String,
     private val idxFile: DocumentFile,
     private val dictFile: DocumentFile
@@ -27,12 +35,70 @@ internal class StarDictDictionary(
     private val channel: FileChannel = java.io.FileInputStream(pfd.fileDescriptor).channel
 
     init {
-        parseIndex(idxFile.uri)
+        val cacheDir = File(context.cacheDir, "stardict-index").apply { mkdirs() }
+        val keyMaterial = buildString {
+            append(id)
+            append('|').append(idxFile.length())
+            append('|').append(idxFile.lastModified())
+        }
+        val cacheName = sha1(keyMaterial) + ".idxcache"
+        val cache = File(cacheDir, cacheName)
+
+        if (!loadCache(cache)) {
+            parseIndex(idxFile.uri)
+            saveCache(cache)
+            // Keep only a bounded number of stale caches.
+            cacheDir.listFiles()
+                ?.sortedByDescending { it.lastModified() }
+                ?.drop(24)
+                ?.forEach { runCatching { it.delete() } }
+        }
+    }
+
+    private fun sha1(s: String): String {
+        val d = MessageDigest.getInstance("SHA-1").digest(s.toByteArray(StandardCharsets.UTF_8))
+        return d.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun loadCache(file: File): Boolean = runCatching {
+        if (!file.isFile) return@runCatching false
+        DataInputStream(BufferedInputStream(file.inputStream(), 256 * 1024)).use { input ->
+            if (input.readInt() != 0x454E504C) return@runCatching false // ENPL
+            if (input.readInt() != 1) return@runCatching false
+            val count = input.readInt()
+            if (count < 0 || count > 5_000_000) return@runCatching false
+            repeat(count) {
+                hits += Hit(input.readUTF(), input.readLong(), input.readInt())
+            }
+        }
+        file.setLastModified(System.currentTimeMillis())
+        true
+    }.getOrElse {
+        hits.clear()
+        false
+    }
+
+    private fun saveCache(file: File) {
+        runCatching {
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            DataOutputStream(BufferedOutputStream(tmp.outputStream(), 256 * 1024)).use { out ->
+                out.writeInt(0x454E504C)
+                out.writeInt(1)
+                out.writeInt(hits.size)
+                for (h in hits) {
+                    out.writeUTF(h.word)
+                    out.writeLong(h.offset)
+                    out.writeInt(h.size)
+                }
+            }
+            if (file.exists()) file.delete()
+            tmp.renameTo(file)
+        }
     }
 
     private fun parseIndex(uri: Uri) {
         resolver.openInputStream(uri)?.use { raw ->
-            BufferedInputStream(raw, 128 * 1024).use { input ->
+            BufferedInputStream(raw, 256 * 1024).use { input ->
                 val word = ByteArrayOutputStream(64)
                 while (true) {
                     word.reset()
@@ -59,6 +125,7 @@ internal class StarDictDictionary(
                         ((meta[5].toInt() and 0xff) shl 16) or
                         ((meta[6].toInt() and 0xff) shl 8) or
                         (meta[7].toInt() and 0xff)
+
                     hits += Hit(word.toString(StandardCharsets.UTF_8.name()), off, size)
                 }
             }
@@ -96,6 +163,7 @@ internal class StarDictDictionary(
     fun suggest(prefix: String, limit: Int): List<String> {
         val p = prefix.trim().lowercase(Locale.ROOT)
         if (p.isEmpty()) return emptyList()
+
         var lo = 0
         var hi = hits.size
         while (lo < hi) {
@@ -103,6 +171,7 @@ internal class StarDictDictionary(
             val w = hits[mid].word.lowercase(Locale.ROOT)
             if (w < p) lo = mid + 1 else hi = mid
         }
+
         val out = ArrayList<String>(limit)
         var i = lo
         while (i < hits.size && out.size < limit) {

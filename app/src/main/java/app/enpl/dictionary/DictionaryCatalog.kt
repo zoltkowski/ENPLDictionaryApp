@@ -10,10 +10,20 @@ import java.util.Locale
 
 internal class DictionaryCatalog private constructor(
     val treeUri: Uri,
-    private val dictionaries: List<StarDictDictionary>
+    private val dictionaries: List<StarDictDictionary>,
+    val allDictionaries: List<DictionaryInfo>
 ) : Closeable {
 
     data class Result(val dictionary: String, val word: String, val html: String)
+
+    private data class FileSet(
+        val id: String,
+        val base: String,
+        val ifo: DocumentFile,
+        val idx: DocumentFile,
+        val dict: DocumentFile,
+        val title: String
+    )
 
     companion object {
         fun open(context: Context, treeUri: Uri): DictionaryCatalog {
@@ -23,24 +33,43 @@ internal class DictionaryCatalog private constructor(
 
             val groups = LinkedHashMap<String, MutableMap<String, DocumentFile>>()
             scan(root, groups, depth = 0)
-            val resolver = context.contentResolver
+
+            val discovered = ArrayList<FileSet>()
+            for ((base, files) in groups) {
+                val ifo = files["ifo"] ?: continue
+                val idx = files["idx"] ?: continue
+                val dict = files["dict"] ?: continue
+                val title = readBookName(context, ifo) ?: base.substringAfterLast('/')
+                discovered += FileSet(base, base, ifo, idx, dict, title)
+            }
+            if (discovered.isEmpty()) {
+                throw IOException("No StarDict dictionaries found (.ifo + .idx + .dict)")
+            }
+
+            val config = DictionaryPreferences.mergeDiscovered(
+                context,
+                discovered.map { it.id to it.title }
+            )
+            val byId = discovered.associateBy { it.id }
             val opened = ArrayList<StarDictDictionary>()
             try {
-                for ((base, files) in groups) {
-                    val ifo = files["ifo"] ?: continue
-                    val idx = files["idx"] ?: continue
-                    val dict = files["dict"] ?: continue
-                    val title = readBookName(context, ifo) ?: base.substringAfterLast('/')
-                    opened += StarDictDictionary(resolver, title, idx, dict)
+                for (cfg in config) {
+                    if (!cfg.enabled) continue
+                    val fs = byId[cfg.id] ?: continue
+                    opened += StarDictDictionary(
+                        context = context.applicationContext,
+                        resolver = context.contentResolver,
+                        id = fs.id,
+                        title = fs.title,
+                        idxFile = fs.idx,
+                        dictFile = fs.dict
+                    )
                 }
             } catch (e: Exception) {
                 opened.forEach { runCatching { it.close() } }
                 throw e
             }
-            if (opened.isEmpty()) {
-                throw IOException("No StarDict dictionaries found (.ifo + .idx + .dict)")
-            }
-            return DictionaryCatalog(treeUri, opened)
+            return DictionaryCatalog(treeUri, opened, config)
         }
 
         private fun scan(
@@ -62,7 +91,8 @@ internal class DictionaryCatalog private constructor(
                     lower.endsWith(".dict") -> "dict"
                     else -> null
                 } ?: continue
-                val stem = name.substring(0, name.length - (ext.length + 1))
+
+                val stem = name.substring(0, name.length - ext.length - 1)
                 val key = "${dir.uri}/$stem"
                 groups.getOrPut(key) { LinkedHashMap() }[ext] = file
             }
@@ -70,9 +100,12 @@ internal class DictionaryCatalog private constructor(
 
         private fun readBookName(context: Context, ifo: DocumentFile): String? =
             runCatching {
-                context.contentResolver.openInputStream(ifo.uri)?.bufferedReader(Charsets.UTF_8)?.useLines { lines ->
-                    lines.firstOrNull { it.startsWith("bookname=") }?.substringAfter("bookname=")?.trim()
-                }
+                context.contentResolver.openInputStream(ifo.uri)
+                    ?.bufferedReader(Charsets.UTF_8)
+                    ?.useLines { lines ->
+                        lines.firstOrNull { it.startsWith("bookname=") }
+                            ?.substringAfter("bookname=")?.trim()
+                    }
             }.getOrNull()
     }
 
