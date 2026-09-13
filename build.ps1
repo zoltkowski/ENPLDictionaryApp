@@ -73,12 +73,12 @@ if (Test-Path '.\gradlew.bat') {
 
 $task = if ($Variant -eq 'Release') { ':app:assembleRelease' } else { ':app:assembleDebug' }
 if ($Clean) {
-    & $gradleCmd --no-daemon clean
+    & $gradleCmd --no-daemon --configuration-cache clean
     if ($LASTEXITCODE -ne 0) { Fail "Gradle clean failed." }
 }
 
 Write-Host "Running $task..." -ForegroundColor Cyan
-& $gradleCmd --no-daemon $task
+& $gradleCmd --no-daemon --configuration-cache $task
 if ($LASTEXITCODE -ne 0) { Fail "Gradle build failed." }
 
 $variantLower = $Variant.ToLowerInvariant()
