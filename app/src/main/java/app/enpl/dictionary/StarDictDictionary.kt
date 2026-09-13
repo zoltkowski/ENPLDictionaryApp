@@ -11,6 +11,7 @@ import java.io.Closeable
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
@@ -40,6 +41,7 @@ internal class StarDictDictionary(
             append(id)
             append('|').append(idxFile.length())
             append('|').append(idxFile.lastModified())
+            append('|').append(quickFingerprint(idxFile))
         }
         val cacheName = sha1(keyMaterial) + ".idxcache"
         val cache = File(cacheDir, cacheName)
@@ -53,6 +55,69 @@ internal class StarDictDictionary(
                 ?.drop(24)
                 ?.forEach { runCatching { it.delete() } }
         }
+    }
+
+    companion object {
+        fun invalidateAllIndexCaches(context: Context) {
+            val dir = File(context.cacheDir, "stardict-index")
+            dir.listFiles()?.forEach { runCatching { it.delete() } }
+        }
+    }
+
+    /**
+     * Cheap content signature for the .idx file. We hash three small windows
+     * (start/middle/end), so a replacement is detected even when a provider
+     * reports the same size and timestamp.
+     */
+    private fun quickFingerprint(file: DocumentFile): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val length = file.length().coerceAtLeast(0L)
+        digest.update(length.toString().toByteArray(StandardCharsets.UTF_8))
+
+        val window = 64 * 1024
+        val positions = linkedSetOf(
+            0L,
+            (length / 2L - window / 2L).coerceAtLeast(0L),
+            (length - window).coerceAtLeast(0L)
+        )
+
+        val sampled = runCatching {
+            resolver.openFileDescriptor(file.uri, "r")?.use { fd ->
+                FileInputStream(fd.fileDescriptor).channel.use { ch ->
+                    val buf = ByteBuffer.allocate(window)
+                    for (position in positions) {
+                        if (position >= length) continue
+                        buf.clear()
+                        ch.position(position)
+                        val wanted = minOf(window.toLong(), length - position).toInt()
+                        buf.limit(wanted)
+                        while (buf.hasRemaining()) {
+                            if (ch.read(buf) < 0) break
+                        }
+                        digest.update(buf.array(), 0, buf.position())
+                    }
+                }
+            }
+            true
+        }.getOrDefault(false)
+
+        if (!sampled) {
+            // Conservative fallback for providers that do not support seekable FDs.
+            runCatching {
+                resolver.openInputStream(file.uri)?.use { input ->
+                    val buf = ByteArray(window)
+                    var remaining = window * 2
+                    while (remaining > 0) {
+                        val n = input.read(buf, 0, minOf(buf.size, remaining))
+                        if (n <= 0) break
+                        digest.update(buf, 0, n)
+                        remaining -= n
+                    }
+                }
+            }
+        }
+
+        return digest.digest().take(12).joinToString("") { "%02x".format(it) }
     }
 
     private fun sha1(s: String): String {

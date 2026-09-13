@@ -10,11 +10,16 @@ import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.view.ActionMode
 import android.view.Gravity
+import android.view.Menu
+import android.view.MenuItem
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -25,8 +30,8 @@ import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
-import android.widget.PopupMenu
 import android.widget.ProgressBar
+import android.widget.PopupWindow
 import android.widget.TextView
 import android.widget.Toast
 import java.net.URLDecoder
@@ -51,7 +56,11 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var queryBox: EditText
     private lateinit var web: WebView
     private lateinit var progress: ProgressBar
-    private lateinit var suggestionHost: LinearLayout
+    private var suggestionPopup: PopupWindow? = null
+    private var suggestionContent: LinearLayout? = null
+    private val suggestionRows = ArrayList<TextView>(8)
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var suggestionRunnable: Runnable? = null
     private lateinit var ukLabel: TextView
     private lateinit var usLabel: TextView
 
@@ -173,20 +182,6 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         )
         root.addView(bar)
 
-        // Explicit suggestion panel: easier to see/control than a ListView and
-        // guaranteed to remain above the WebView.
-        suggestionHost = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            elevation = dp(3).toFloat()
-        }
-        root.addView(
-            suggestionHost,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
 
         progress = ProgressBar(this).apply {
             isIndeterminate = true
@@ -199,7 +194,9 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
 
         web = WebView(this).apply {
             setBackgroundColor(if (dark) Color.rgb(16, 18, 20) else Color.rgb(250, 250, 250))
-            settings.javaScriptEnabled = false
+            // Needed only to read window.getSelection() for the EN-PL contextual action.
+            // Entries are loaded from local dictionary data; no network permission is used.
+            settings.javaScriptEnabled = true
             settings.builtInZoomControls = false
             settings.displayZoomControls = false
             settings.defaultFontSize = 18
@@ -253,31 +250,101 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         queryBox.setHintTextColor(if (dark) Color.rgb(145, 145, 145) else Color.rgb(110, 110, 110))
         ukLabel.setTextColor(secondary)
         usLabel.setTextColor(secondary)
-        suggestionHost.setBackgroundColor(if (dark) Color.rgb(28, 30, 33) else Color.WHITE)
         web.setBackgroundColor(bg)
     }
 
     private fun showMenu(anchor: View) {
-        PopupMenu(this, anchor).apply {
-            menu.add("History")
-            menu.add("Dictionaries")
-            menu.add("Choose dictionary folder")
-            menu.add(if (dark) "Light mode" else "Dark mode")
-            setOnMenuItemClickListener {
-                when (it.title.toString()) {
-                    "History" -> startActivity(
-                        Intent(this@DictionaryActivity, HistoryActivity::class.java)
-                    )
-                    "Dictionaries" -> startActivityForResult(
-                        Intent(this@DictionaryActivity, DictionarySettingsActivity::class.java),
-                        REQ_DICT_SETTINGS
-                    )
-                    "Choose dictionary folder" -> chooseDictionaryFolder()
-                    "Light mode", "Dark mode" -> toggleTheme()
+        val menuBg = if (dark) Color.rgb(12, 12, 12) else Color.WHITE
+        val menuFg = if (dark) Color.WHITE else Color.rgb(20, 20, 20)
+        val divider = if (dark) Color.rgb(52, 52, 52) else Color.rgb(225, 225, 225)
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(menuBg)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+
+        lateinit var popup: PopupWindow
+
+        fun addItem(label: String, action: () -> Unit) {
+            val row = TextView(this).apply {
+                text = label
+                textSize = 17f
+                setTextColor(menuFg)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), 0, dp(20), 0)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    popup.dismiss()
+                    action()
                 }
-                true
             }
-        }.show()
+            content.addView(
+                row,
+                LinearLayout.LayoutParams(dp(250), dp(48))
+            )
+            content.addView(
+                View(this).apply { setBackgroundColor(divider) },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
+            )
+        }
+
+        addItem("History") {
+            startActivity(Intent(this, HistoryActivity::class.java))
+        }
+        addItem("Dictionaries") {
+            startActivityForResult(
+                Intent(this, DictionarySettingsActivity::class.java),
+                REQ_DICT_SETTINGS
+            )
+        }
+        addItem("Reload dictionaries") {
+            reloadDictionaries()
+        }
+        addItem("Choose dictionary folder") {
+            chooseDictionaryFolder()
+        }
+        addItem(if (dark) "Light mode" else "Dark mode") {
+            toggleTheme()
+        }
+
+        // Remove divider after the last menu row.
+        if (content.childCount > 0) content.removeViewAt(content.childCount - 1)
+
+        val versionName = runCatching {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+        }.getOrDefault("?")
+
+        content.addView(
+            TextView(this).apply {
+                text = "v$versionName"
+                textSize = 11f
+                alpha = 0.55f
+                gravity = Gravity.CENTER_HORIZONTAL
+                setTextColor(menuFg)
+                setPadding(dp(12), dp(8), dp(12), dp(6))
+                isClickable = false
+                isFocusable = false
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+
+        popup = PopupWindow(
+            content,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            true
+        ).apply {
+            isOutsideTouchable = true
+            elevation = dp(8).toFloat()
+            setBackgroundDrawable(ColorDrawable(menuBg))
+        }
+
+        popup.showAsDropDown(anchor, 0, -dp(4))
     }
 
     private fun toggleTheme() {
@@ -294,6 +361,18 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
             )
         }
         recreate()
+    }
+
+    private fun reloadDictionaries() {
+        val raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_TREE_URI, null)
+        if (raw.isNullOrBlank()) {
+            chooseDictionaryFolder()
+            return
+        }
+
+        hideSuggestions()
+        StarDictDictionary.invalidateAllIndexCaches(applicationContext)
+        openFolder(Uri.parse(raw), intent)
     }
 
     private fun chooseDictionaryFolder() {
@@ -376,65 +455,163 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
     private fun requestSuggestions(raw: String) {
         val active = catalog ?: return
         val q = cleanQuery(raw)
+
+        suggestionRunnable?.let(uiHandler::removeCallbacks)
+        suggestionRunnable = null
+
         if (q.isBlank()) {
             hideSuggestions()
             return
         }
 
         val generation = suggestGeneration.incrementAndGet()
-        executor.execute {
-            val list = runCatching { active.suggest(q, 24) }.getOrDefault(emptyList())
-            runOnUiThread {
-                if (generation != suggestGeneration.get()) return@runOnUiThread
-                renderLiveSuggestions(list)
+        val runnable = Runnable {
+            executor.execute {
+                val list = runCatching { active.suggest(q, 24) }.getOrDefault(emptyList())
+                runOnUiThread {
+                    if (generation != suggestGeneration.get()) return@runOnUiThread
+                    renderLiveSuggestions(list)
+                }
             }
+        }
+        suggestionRunnable = runnable
+        // A short debounce avoids rebuilding the suggestion UI for every transient keystroke.
+        uiHandler.postDelayed(runnable, 85L)
+    }
+
+    private fun ensureSuggestionPopup() {
+        if (suggestionPopup != null && suggestionContent != null && suggestionRows.size == 8) return
+
+        val panelBg = if (dark) Color.rgb(28, 30, 33) else Color.WHITE
+        val fg = if (dark) Color.rgb(235, 235, 235) else Color.rgb(25, 25, 25)
+        val divider = if (dark) Color.rgb(55, 57, 60) else Color.rgb(225, 225, 225)
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(panelBg)
+        }
+        suggestionRows.clear()
+
+        repeat(8) {
+            val row = TextView(this).apply {
+                textSize = 17f
+                setTextColor(fg)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(14), 0, dp(14), 0)
+                setBackgroundColor(panelBg)
+                visibility = View.GONE
+                setOnClickListener {
+                    val word = text.toString()
+                    if (word.isNotBlank()) {
+                        hideSuggestions()
+                        lookup(word, recordHistory = true)
+                    }
+                }
+            }
+            suggestionRows += row
+            content.addView(
+                row,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42))
+            )
+            content.addView(
+                View(this).apply { setBackgroundColor(divider) },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
+            )
+        }
+
+        suggestionContent = content
+        suggestionPopup = PopupWindow(
+            content,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            false
+        ).apply {
+            isOutsideTouchable = true
+            isClippingEnabled = true
+            elevation = dp(5).toFloat()
+            setBackgroundDrawable(ColorDrawable(panelBg))
+            inputMethodMode = PopupWindow.INPUT_METHOD_NEEDED
         }
     }
 
     private fun renderLiveSuggestions(list: List<String>) {
-        suggestionHost.removeAllViews()
-
         if (list.isEmpty()) {
-            suggestionHost.visibility = View.GONE
+            hideSuggestions()
             return
         }
 
-        val fg = if (dark) Color.rgb(235, 235, 235) else Color.rgb(25, 25, 25)
-        val divider = if (dark) Color.rgb(55, 57, 60) else Color.rgb(225, 225, 225)
-
-        for (word in list.take(8)) {
-            val row = TextView(this).apply {
-                text = word
-                textSize = 17f
-                setTextColor(fg)
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), 0, dp(12), 0)
-                setBackgroundColor(if (dark) Color.rgb(28, 30, 33) else Color.WHITE)
-                setOnClickListener {
-                    hideSuggestions()
-                    lookup(word, recordHistory = true)
-                }
+        ensureSuggestionPopup()
+        suggestionRows.forEachIndexed { index, row ->
+            val word = list.getOrNull(index)
+            if (word == null) {
+                row.visibility = View.GONE
+                row.text = ""
+            } else {
+                row.text = word
+                row.visibility = View.VISIBLE
             }
-            suggestionHost.addView(
-                row,
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(42)
-                )
-            )
-            suggestionHost.addView(View(this).apply {
-                setBackgroundColor(divider)
-            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1))
         }
 
-        suggestionHost.visibility = View.VISIBLE
-        suggestionHost.bringToFront()
+        val width = (root.width - root.paddingLeft - root.paddingRight).coerceAtLeast(dp(220))
+        val popup = suggestionPopup ?: return
+        popup.width = width
+
+        if (!popup.isShowing) {
+            popup.showAsDropDown(queryBox, -dp(48), -dp(1))
+        } else {
+            // Update the same popup in place: no dismiss/recreate flash between keystrokes.
+            popup.update(width, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
     }
 
     private fun hideSuggestions() {
+        suggestionRunnable?.let(uiHandler::removeCallbacks)
+        suggestionRunnable = null
         suggestGeneration.incrementAndGet()
-        suggestionHost.removeAllViews()
-        suggestionHost.visibility = View.GONE
+        suggestionPopup?.dismiss()
+    }
+
+
+    override fun onActionModeStarted(mode: ActionMode) {
+        super.onActionModeStarted(mode)
+
+        // WebView does not expose TextView's customSelectionActionModeCallback API.
+        // Add our action as soon as Android reports the selection ActionMode.
+        addDictionarySelectionAction(mode.menu)
+
+        mode.menu.findItem(0x454E504C)?.setOnMenuItemClickListener {
+            web.evaluateJavascript(
+                "(function(){return window.getSelection ? window.getSelection().toString() : '';})()"
+            ) { raw ->
+                val selectedText = decodeJavascriptString(raw)
+                mode.finish()
+                if (selectedText.isNotBlank()) lookup(selectedText, recordHistory = true)
+            }
+            true
+        }
+    }
+
+    private fun addDictionarySelectionAction(menu: Menu) {
+        if (menu.findItem(0x454E504C) != null) return
+        // This callback runs while the toolbar is being built, rather than after it is shown.
+        // That gives our order=0 item the best chance to appear first in our own app.
+        menu.add(Menu.NONE, 0x454E504C, 0, "EN-PL")
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS or MenuItem.SHOW_AS_ACTION_WITH_TEXT)
+    }
+
+    private fun decodeJavascriptString(raw: String?): String {
+        if (raw.isNullOrBlank() || raw == "null") return ""
+        return runCatching {
+            val body = if (raw.length >= 2 && raw.first() == '"' && raw.last() == '"') {
+                raw.substring(1, raw.length - 1)
+            } else raw
+            body.replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
+                .trim()
+        }.getOrDefault("")
     }
 
     private fun handleUrl(uri: Uri?): Boolean {
@@ -610,6 +787,12 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         super.onDestroy()
+        suggestionRunnable?.let(uiHandler::removeCallbacks)
+        suggestionRunnable = null
+        suggestionPopup?.dismiss()
+        suggestionPopup = null
+        suggestionContent = null
+        suggestionRows.clear()
         catalog?.close()
         catalog = null
         tts?.stop()
