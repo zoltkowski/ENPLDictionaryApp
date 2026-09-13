@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'app.enpl.dictionary'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'app.enpl.dictionary'
+        minSdk 23
+        targetSdk 35
+        versionCode 2
+        versionName '0.2.0'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/*']
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.documentfile:documentfile:1.0.1'
+}

@@ -1,0 +1,15 @@
+<resources>
+    <style name="Theme.ENPL" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:colorAccent">#5B76D8</item>
+        <item name="android:navigationBarColor">#101214</item>
+    </style>
+    <style name="Theme.ENPL.Lookup" parent="android:style/Theme.Material.Light.Dialog.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowCloseOnTouchOutside">true</item>
+        <item name="android:windowMinWidthMajor">96%</item>
+        <item name="android:windowMinWidthMinor">96%</item>
+        <item name="android:colorAccent">#5B76D8</item>
+    </style>
+</resources>
