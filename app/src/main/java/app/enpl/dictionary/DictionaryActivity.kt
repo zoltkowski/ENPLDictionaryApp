@@ -23,6 +23,7 @@ import android.view.MenuItem
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -71,6 +72,7 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
     private var suppressWatcher = false
     private val suggestGeneration = AtomicInteger(0)
     private lateinit var history: HistoryStore
+    private var showingDictionarySetupMessage = false
 
     protected abstract fun isPopup(): Boolean
 
@@ -150,6 +152,7 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(8), dp(7), dp(8), dp(6))
         }
+        applySystemBarInsets(root)
 
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -299,12 +302,7 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                 REQ_DICT_SETTINGS
             )
         }
-        addItem("Reload dictionaries") {
-            reloadDictionaries()
-        }
-        addItem("Choose dictionary folder") {
-            chooseDictionaryFolder()
-        }
+
         addItem(if (dark) "Light mode" else "Dark mode") {
             toggleTheme()
         }
@@ -363,24 +361,33 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         recreate()
     }
 
-    private fun reloadDictionaries() {
-        val raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_TREE_URI, null)
-        if (raw.isNullOrBlank()) {
-            chooseDictionaryFolder()
-            return
-        }
+    private fun applySystemBarInsets(view: View) {
+        val left = dp(8)
+        val top = dp(7)
+        val right = dp(8)
+        val bottom = dp(6)
 
-        hideSuggestions()
-        StarDictDictionary.invalidateAllIndexCaches(applicationContext)
-        openFolder(Uri.parse(raw), intent)
-    }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
+            view.setOnApplyWindowInsetsListener { v, insets ->
+                val statusTop = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    insets.getInsets(WindowInsets.Type.statusBars()).top
+                } else {
+                    @Suppress("DEPRECATION")
+                    insets.systemWindowInsetTop
+                }
 
-    private fun chooseDictionaryFolder() {
-        val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                val navBottom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    insets.getInsets(WindowInsets.Type.navigationBars()).bottom
+                } else {
+                    @Suppress("DEPRECATION")
+                    insets.systemWindowInsetBottom
+                }
+
+                v.setPadding(left, top + statusTop, right, bottom + navBottom)
+                insets
+            }
+            view.requestApplyInsets()
         }
-        startActivityForResult(i, REQ_FOLDER)
     }
 
     @Deprecated("Deprecated in Android API; retained for minSdk 23 compatibility")
@@ -389,7 +396,7 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
 
         if (requestCode == REQ_DICT_SETTINGS) {
             val raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_TREE_URI, null)
-            if (!raw.isNullOrBlank()) openFolder(Uri.parse(raw), intent)
+            if (!raw.isNullOrBlank()) openFolder(Uri.parse(raw), null)
             return
         }
 
@@ -413,9 +420,11 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
     private fun loadStoredFolderThenIntent(intent: Intent?) {
         val raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_TREE_URI, null)
         if (raw.isNullOrBlank()) {
+            showingDictionarySetupMessage = true
             showMessage(
-                "No dictionary folder selected.<br><br>" +
-                    "Open <B>☰ → Choose dictionary folder</B>."
+                "<B>No dictionaries configured.</B><br><br>" +
+                    "Open <B>☰ → Dictionaries</B>, choose a folder containing " +
+                    "StarDict files (<B>.ifo + .idx + .dict</B>), then return here."
             )
             return
         }
@@ -434,11 +443,14 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
 
                 runOnUiThread {
                     progress.visibility = View.GONE
+
+                    if (showingDictionarySetupMessage) {
+                        showingDictionarySetupMessage = false
+                        renderEntry("")
+                    }
+
                     // Deliberately no toast/status message here.
                     handleIntent(pendingIntent)
-
-                    // If opened manually with no query, keep the current page as-is.
-                    // On first app start with no query, leave the neutral blank surface.
                 }
             } catch (e: Exception) {
                 runOnUiThread {

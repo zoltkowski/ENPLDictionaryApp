@@ -16,6 +16,9 @@ internal class DictionaryCatalog private constructor(
 
     data class Result(val dictionary: String, val word: String, val html: String)
 
+    val totalEntries: Int
+        get() = dictionaries.sumOf { it.size }
+
     private data class FileSet(
         val id: String,
         val base: String,

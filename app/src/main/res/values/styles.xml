@@ -8,4 +8,5 @@
         <item name="android:windowDisablePreview">true</item>
         <item name="android:windowBackground">@color/enpl_start_bg</item>
     </style>
+    <style name="Theme.ENPL.LookupTrampoline" parent="android:style/Theme.NoDisplay" />
 </resources>
