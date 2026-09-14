@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.channels.FileChannel
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 internal class StarDictDictionary(
     context: Context,
@@ -30,10 +31,15 @@ internal class StarDictDictionary(
 
     data class Hit(val word: String, val offset: Long, val size: Int)
 
+    internal class PrefixCursor internal constructor(
+        internal val prefixLower: String,
+        internal var index: Int
+    )
+
     private val hits = ArrayList<Hit>()
     private val pfd = resolver.openFileDescriptor(dictFile.uri, "r")
         ?: throw IOException("Cannot open ${dictFile.name}")
-    private val channel: FileChannel = java.io.FileInputStream(pfd.fileDescriptor).channel
+    private val channel: FileChannel = FileInputStream(pfd.fileDescriptor).channel
 
     init {
         val cacheDir = File(context.cacheDir, "stardict-index").apply { mkdirs() }
@@ -46,10 +52,16 @@ internal class StarDictDictionary(
         val cacheName = sha1(keyMaterial) + ".idxcache"
         val cache = File(cacheDir, cacheName)
 
-        if (!loadCache(cache)) {
-            parseIndex(idxFile.uri)
-            saveCache(cache)
-            // Keep only a bounded number of stale caches.
+        val inMemory = memoryIndexCache[cacheName]
+        if (inMemory != null) {
+            hits.addAll(inMemory)
+        } else {
+            if (!loadCache(cache)) {
+                parseIndex(idxFile.uri)
+                sortHitsForLookup()
+                saveCache(cache)
+            }
+            memoryIndexCache[cacheName] = ArrayList(hits)
             cacheDir.listFiles()
                 ?.sortedByDescending { it.lastModified() }
                 ?.drop(24)
@@ -58,17 +70,15 @@ internal class StarDictDictionary(
     }
 
     companion object {
+        private val memoryIndexCache = ConcurrentHashMap<String, List<Hit>>()
+
         fun invalidateAllIndexCaches(context: Context) {
+            memoryIndexCache.clear()
             val dir = File(context.cacheDir, "stardict-index")
             dir.listFiles()?.forEach { runCatching { it.delete() } }
         }
     }
 
-    /**
-     * Cheap content signature for the .idx file. We hash three small windows
-     * (start/middle/end), so a replacement is detected even when a provider
-     * reports the same size and timestamp.
-     */
     private fun quickFingerprint(file: DocumentFile): String {
         val digest = MessageDigest.getInstance("SHA-256")
         val length = file.length().coerceAtLeast(0L)
@@ -102,7 +112,6 @@ internal class StarDictDictionary(
         }.getOrDefault(false)
 
         if (!sampled) {
-            // Conservative fallback for providers that do not support seekable FDs.
             runCatching {
                 resolver.openInputStream(file.uri)?.use { input ->
                     val buf = ByteArray(window)
@@ -116,20 +125,20 @@ internal class StarDictDictionary(
                 }
             }
         }
-
         return digest.digest().take(12).joinToString("") { "%02x".format(it) }
     }
 
     private fun sha1(s: String): String {
-        val d = MessageDigest.getInstance("SHA-1").digest(s.toByteArray(StandardCharsets.UTF_8))
+        val d = MessageDigest.getInstance("SHA-1")
+            .digest(s.toByteArray(StandardCharsets.UTF_8))
         return d.joinToString("") { "%02x".format(it) }
     }
 
     private fun loadCache(file: File): Boolean = runCatching {
         if (!file.isFile) return@runCatching false
         DataInputStream(BufferedInputStream(file.inputStream(), 256 * 1024)).use { input ->
-            if (input.readInt() != 0x454E504C) return@runCatching false // ENPL
-            if (input.readInt() != 1) return@runCatching false
+            if (input.readInt() != 0x454E504C) return@runCatching false
+            if (input.readInt() != 2) return@runCatching false
             val count = input.readInt()
             if (count < 0 || count > 5_000_000) return@runCatching false
             repeat(count) {
@@ -148,7 +157,7 @@ internal class StarDictDictionary(
             val tmp = File(file.parentFile, file.name + ".tmp")
             DataOutputStream(BufferedOutputStream(tmp.outputStream(), 256 * 1024)).use { out ->
                 out.writeInt(0x454E504C)
-                out.writeInt(1)
+                out.writeInt(2)
                 out.writeInt(hits.size)
                 for (h in hits) {
                     out.writeUTF(h.word)
@@ -182,6 +191,7 @@ internal class StarDictDictionary(
                         if (n < 0) throw IOException("Truncated StarDict index: ${idxFile.name}")
                         got += n
                     }
+
                     val off = ((meta[0].toLong() and 0xff) shl 24) or
                         ((meta[1].toLong() and 0xff) shl 16) or
                         ((meta[2].toLong() and 0xff) shl 8) or
@@ -197,8 +207,40 @@ internal class StarDictDictionary(
         } ?: throw IOException("Cannot read ${idxFile.name}")
     }
 
+    private fun sortHitsForLookup() {
+        hits.sortWith(
+            compareBy<Hit> { it.word.lowercase(Locale.ROOT) }
+                .thenBy { it.word }
+        )
+    }
+
     private fun ciCompare(a: String, b: String): Int =
         a.lowercase(Locale.ROOT).compareTo(b.lowercase(Locale.ROOT))
+
+    private fun lowerBound(prefixLower: String): Int {
+        var lo = 0
+        var hi = hits.size
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            val w = hits[mid].word.lowercase(Locale.ROOT)
+            if (w < prefixLower) lo = mid + 1 else hi = mid
+        }
+        return lo
+    }
+
+    internal fun openPrefixCursor(prefix: String): PrefixCursor {
+        val p = prefix.trim().lowercase(Locale.ROOT)
+        return PrefixCursor(p, lowerBound(p))
+    }
+
+    internal fun nextPrefix(cursor: PrefixCursor): String? {
+        if (cursor.prefixLower.isEmpty()) return null
+        if (cursor.index >= hits.size) return null
+        val word = hits[cursor.index].word
+        if (!word.lowercase(Locale.ROOT).startsWith(cursor.prefixLower)) return null
+        cursor.index++
+        return word
+    }
 
     fun findExact(query: String): Hit? {
         var lo = 0
@@ -226,24 +268,11 @@ internal class StarDictDictionary(
     }
 
     fun suggest(prefix: String, limit: Int): List<String> {
-        val p = prefix.trim().lowercase(Locale.ROOT)
-        if (p.isEmpty()) return emptyList()
-
-        var lo = 0
-        var hi = hits.size
-        while (lo < hi) {
-            val mid = (lo + hi) ushr 1
-            val w = hits[mid].word.lowercase(Locale.ROOT)
-            if (w < p) lo = mid + 1 else hi = mid
-        }
-
+        val cursor = openPrefixCursor(prefix)
         val out = ArrayList<String>(limit)
-        var i = lo
-        while (i < hits.size && out.size < limit) {
-            val w = hits[i].word
-            if (!w.lowercase(Locale.ROOT).startsWith(p)) break
-            out += w
-            i++
+        while (out.size < limit) {
+            val next = nextPrefix(cursor) ?: break
+            out += next
         }
         return out
     }

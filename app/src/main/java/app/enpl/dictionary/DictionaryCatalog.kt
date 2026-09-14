@@ -7,6 +7,7 @@ import java.io.Closeable
 import java.io.IOException
 import java.util.LinkedHashMap
 import java.util.Locale
+import java.util.PriorityQueue
 
 internal class DictionaryCatalog private constructor(
     val treeUri: Uri,
@@ -15,6 +16,7 @@ internal class DictionaryCatalog private constructor(
 ) : Closeable {
 
     data class Result(val dictionary: String, val word: String, val html: String)
+    private data class SuggestionNode(val dictionaryIndex: Int, val word: String)
 
     val totalEntries: Int
         get() = dictionaries.sumOf { it.size }
@@ -121,16 +123,50 @@ internal class DictionaryCatalog private constructor(
         return out
     }
 
-    fun suggest(prefix: String, limit: Int): List<String> {
-        val seen = LinkedHashSet<String>()
-        for (dict in dictionaries) {
-            for (word in dict.suggest(prefix, limit)) {
-                seen += word
-                if (seen.size >= limit) return seen.toList()
+    /**
+     * Stateful k-way merge over enabled dictionaries.
+     * Each next() call advances only by the requested page size: no rescanning
+     * from the beginning, even if the user scrolls thousands of entries.
+     */
+    inner class SuggestionPager internal constructor(prefix: String) {
+        private val cursors = dictionaries.map { it.openPrefixCursor(prefix) }
+        private val seen = HashSet<String>()
+        private val queue = PriorityQueue<SuggestionNode>(
+            compareBy<SuggestionNode> { it.word.lowercase(Locale.ROOT) }
+                .thenBy { it.word }
+                .thenBy { it.dictionaryIndex }
+        )
+
+        init {
+            for (i in dictionaries.indices) {
+                dictionaries[i].nextPrefix(cursors[i])?.let {
+                    queue += SuggestionNode(i, it)
+                }
             }
         }
-        return seen.toList()
+
+        fun next(limit: Int): List<String> {
+            if (limit <= 0) return emptyList()
+            val out = ArrayList<String>(limit)
+            while (queue.isNotEmpty() && out.size < limit) {
+                val node = queue.remove()
+                dictionaries[node.dictionaryIndex]
+                    .nextPrefix(cursors[node.dictionaryIndex])
+                    ?.let { queue += SuggestionNode(node.dictionaryIndex, it) }
+
+                if (seen.add(node.word)) out += node.word
+            }
+            return out
+        }
+
+        fun hasMore(): Boolean = queue.isNotEmpty()
     }
+
+    fun newSuggestionPager(prefix: String): SuggestionPager =
+        SuggestionPager(prefix)
+
+    fun suggest(prefix: String, limit: Int): List<String> =
+        newSuggestionPager(prefix).next(limit)
 
     val dictionaryCount: Int get() = dictionaries.size
     val entryCount: Int get() = dictionaries.sumOf { it.size }

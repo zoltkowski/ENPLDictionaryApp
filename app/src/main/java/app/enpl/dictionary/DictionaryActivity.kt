@@ -2,13 +2,13 @@ package app.enpl.dictionary
 
 import android.app.Activity
 import android.app.SearchManager
-import android.content.Intent
 import android.app.UiModeManager
+import android.content.Intent
 import android.content.res.Configuration
-import android.os.Build
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -16,11 +16,12 @@ import android.speech.tts.TextToSpeech
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
+import android.widget.AbsListView
 import android.view.ActionMode
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.Menu
 import android.view.MenuItem
-import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -28,11 +29,13 @@ import android.view.inputmethod.EditorInfo
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.BaseAdapter
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
-import android.widget.ProgressBar
+import android.widget.ListView
 import android.widget.PopupWindow
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import java.net.URLDecoder
@@ -50,52 +53,90 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         private const val PREF_TREE_URI = "dictionary_tree_uri"
         private const val REQ_FOLDER = 4107
         private const val REQ_DICT_SETTINGS = 4108
+
+        private const val SUGGEST_PAGE_SIZE = 80
+        private const val SUGGEST_VISIBLE_ROWS = 8
+        private const val SUGGEST_PREFETCH_ROWS = 18
+        private const val SUGGEST_DEBOUNCE_MS = 65L
     }
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+
     private lateinit var root: LinearLayout
     private lateinit var queryBox: EditText
     private lateinit var web: WebView
     private lateinit var progress: ProgressBar
-    private var suggestionPopup: PopupWindow? = null
-    private var suggestionContent: LinearLayout? = null
-    private val suggestionRows = ArrayList<TextView>(8)
-    private val uiHandler = Handler(Looper.getMainLooper())
-    private var suggestionRunnable: Runnable? = null
     private lateinit var ukLabel: TextView
     private lateinit var usLabel: TextView
 
+    private var suggestionPopup: PopupWindow? = null
+    private var suggestionList: ListView? = null
+    private var suggestionAdapter: BaseAdapter? = null
+    private val suggestionItems = ArrayList<String>()
+    private var suggestionPager: DictionaryCatalog.SuggestionPager? = null
+    private var suggestionLoading = false
+    private var suggestionHasMore = false
+    private var suggestionPrefix = ""
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var suggestionRunnable: Runnable? = null
+    private val suggestGeneration = AtomicInteger(0)
+
     private var catalog: DictionaryCatalog? = null
     private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var pendingSpeakLocale: Locale? = null
     private var currentWord = ""
     private var dark = false
     private var suppressWatcher = false
-    private val suggestGeneration = AtomicInteger(0)
     private lateinit var history: HistoryStore
     private var showingDictionarySetupMessage = false
+
+    // External lookups hide the intermediate "empty UI -> query -> definition"
+    // sequence. The complete UI is revealed only when the final WebView page is ready.
+    private var deferInitialExternalPresentation = false
+    private var revealAfterNextPage = false
 
     protected abstract fun isPopup(): Boolean
 
     override fun onCreate(state: Bundle?) {
-        // Keep Android's per-app day/night state synchronized with our saved setting.
-        // On Android 12+ this controls the system launch/splash background on the NEXT cold start.
         syncPlatformNightMode()
         super.onCreate(state)
+
         dark = resolveDarkMode()
-        val bg = if (dark) Color.rgb(16, 18, 20) else Color.rgb(250, 250, 250)
+        val bg = pageBackground()
         window.setBackgroundDrawable(ColorDrawable(bg))
         history = HistoryStore(this)
 
+        val initialQuery = cleanQuery(queryFromIntent(intent))
+        deferInitialExternalPresentation =
+            initialQuery.isNotBlank() &&
+                (this is ExternalLookupActivity || this is FloatingLookupActivity)
+
         buildUi()
-        tts = TextToSpeech(this, this)
+
+        if (deferInitialExternalPresentation) {
+            root.visibility = View.INVISIBLE
+            queryBox.clearFocus()
+            window.setSoftInputMode(
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+            )
+        }
+
+        // TTS is intentionally lazy: binding the speech service is unnecessary work
+        // on the latency-critical lookup path.
         loadStoredFolderThenIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        deferInitialExternalPresentation = false
+        root.visibility = View.VISIBLE
         handleIntent(intent)
     }
+
+    private fun pageBackground(): Int =
+        if (dark) Color.rgb(16, 18, 20) else Color.rgb(250, 250, 250)
 
     private fun resolveDarkMode(): Boolean {
         val p = getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -185,7 +226,6 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         )
         root.addView(bar)
 
-
         progress = ProgressBar(this).apply {
             isIndeterminate = true
             visibility = View.GONE
@@ -196,9 +236,7 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         )
 
         web = WebView(this).apply {
-            setBackgroundColor(if (dark) Color.rgb(16, 18, 20) else Color.rgb(250, 250, 250))
-            // Needed only to read window.getSelection() for the EN-PL contextual action.
-            // Entries are loaded from local dictionary data; no network permission is used.
+            setBackgroundColor(pageBackground())
             settings.javaScriptEnabled = true
             settings.builtInZoomControls = false
             settings.displayZoomControls = false
@@ -213,6 +251,17 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                 @Deprecated("Deprecated in Android API")
                 override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean =
                     handleUrl(url?.let(Uri::parse))
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    if (revealAfterNextPage) {
+                        revealAfterNextPage = false
+                        this@DictionaryActivity.progress.visibility = View.GONE
+                        root.visibility = View.VISIBLE
+                        queryBox.clearFocus()
+                        web.requestFocus()
+                    }
+                }
             }
         }
         root.addView(web, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -244,13 +293,15 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     private fun applyChromeTheme() {
-        val bg = if (dark) Color.rgb(16, 18, 20) else Color.rgb(250, 250, 250)
+        val bg = pageBackground()
         val fg = if (dark) Color.rgb(235, 235, 235) else Color.rgb(25, 25, 25)
         val secondary = if (dark) Color.rgb(175, 175, 175) else Color.rgb(90, 90, 90)
 
         root.setBackgroundColor(bg)
         queryBox.setTextColor(fg)
-        queryBox.setHintTextColor(if (dark) Color.rgb(145, 145, 145) else Color.rgb(110, 110, 110))
+        queryBox.setHintTextColor(
+            if (dark) Color.rgb(145, 145, 145) else Color.rgb(110, 110, 110)
+        )
         ukLabel.setTextColor(secondary)
         usLabel.setTextColor(secondary)
         web.setBackgroundColor(bg)
@@ -283,10 +334,7 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                     action()
                 }
             }
-            content.addView(
-                row,
-                LinearLayout.LayoutParams(dp(250), dp(48))
-            )
+            content.addView(row, LinearLayout.LayoutParams(dp(250), dp(48)))
             content.addView(
                 View(this).apply { setBackgroundColor(divider) },
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
@@ -302,12 +350,10 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                 REQ_DICT_SETTINGS
             )
         }
-
         addItem(if (dark) "Light mode" else "Dark mode") {
             toggleTheme()
         }
 
-        // Remove divider after the last menu row.
         if (content.childCount > 0) content.removeViewAt(content.childCount - 1)
 
         val versionName = runCatching {
@@ -322,8 +368,6 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                 gravity = Gravity.CENTER_HORIZONTAL
                 setTextColor(menuFg)
                 setPadding(dp(12), dp(8), dp(12), dp(6))
-                isClickable = false
-                isFocusable = false
             },
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -341,7 +385,6 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
             elevation = dp(8).toFloat()
             setBackgroundDrawable(ColorDrawable(menuBg))
         }
-
         popup.showAsDropDown(anchor, 0, -dp(4))
     }
 
@@ -353,8 +396,7 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
             .apply()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val manager = getSystemService(UiModeManager::class.java)
-            manager?.setApplicationNightMode(
+            getSystemService(UiModeManager::class.java)?.setApplicationNightMode(
                 if (dark) UiModeManager.MODE_NIGHT_YES else UiModeManager.MODE_NIGHT_NO
             )
         }
@@ -375,14 +417,12 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                     @Suppress("DEPRECATION")
                     insets.systemWindowInsetTop
                 }
-
                 val navBottom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     insets.getInsets(WindowInsets.Type.navigationBars()).bottom
                 } else {
                     @Suppress("DEPRECATION")
                     insets.systemWindowInsetBottom
                 }
-
                 v.setPadding(left, top + statusTop, right, bottom + navBottom)
                 insets
             }
@@ -424,7 +464,8 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
             showMessage(
                 "<B>No dictionaries configured.</B><br><br>" +
                     "Open <B>☰ → Dictionaries</B>, choose a folder containing " +
-                    "StarDict files (<B>.ifo + .idx + .dict</B>), then return here."
+                    "StarDict files (<B>.ifo + .idx + .dict</B>), then return here.",
+                revealWhenReady = deferInitialExternalPresentation
             )
             return
         }
@@ -432,7 +473,9 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     private fun openFolder(uri: Uri, pendingIntent: Intent?) {
-        progress.visibility = View.VISIBLE
+        if (!deferInitialExternalPresentation) {
+            progress.visibility = View.VISIBLE
+        }
 
         executor.execute {
             try {
@@ -442,14 +485,14 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                 old?.close()
 
                 runOnUiThread {
-                    progress.visibility = View.GONE
+                    if (!deferInitialExternalPresentation) {
+                        progress.visibility = View.GONE
+                    }
 
                     if (showingDictionarySetupMessage) {
                         showingDictionarySetupMessage = false
                         renderEntry("")
                     }
-
-                    // Deliberately no toast/status message here.
                     handleIntent(pendingIntent)
                 }
             } catch (e: Exception) {
@@ -457,12 +500,15 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                     progress.visibility = View.GONE
                     showMessage(
                         "Could not open dictionary folder: " +
-                            esc(e.message ?: e.javaClass.simpleName)
+                            esc(e.message ?: e.javaClass.simpleName),
+                        revealWhenReady = deferInitialExternalPresentation
                     )
                 }
             }
         }
     }
+
+    // ---------- paged / infinite-scroll suggestions ----------
 
     private fun requestSuggestions(raw: String) {
         val active = catalog ?: return
@@ -477,65 +523,123 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         }
 
         val generation = suggestGeneration.incrementAndGet()
+        suggestionLoading = true
+
         val runnable = Runnable {
             executor.execute {
-                val list = runCatching { active.suggest(q, 24) }.getOrDefault(emptyList())
+                val pager = runCatching { active.newSuggestionPager(q) }.getOrNull()
+                val first = runCatching {
+                    pager?.next(SUGGEST_PAGE_SIZE).orEmpty()
+                }.getOrDefault(emptyList())
+                val more = pager?.hasMore() == true
+
                 runOnUiThread {
                     if (generation != suggestGeneration.get()) return@runOnUiThread
-                    renderLiveSuggestions(list)
+                    suggestionPager = pager
+                    suggestionPrefix = q
+                    suggestionLoading = false
+                    suggestionHasMore = more
+                    suggestionItems.clear()
+                    suggestionItems.addAll(first)
+                    suggestionAdapter?.notifyDataSetChanged()
+
+                    if (first.isEmpty()) hideSuggestions()
+                    else renderSuggestionPopup()
                 }
             }
         }
+
         suggestionRunnable = runnable
-        // A short debounce avoids rebuilding the suggestion UI for every transient keystroke.
-        uiHandler.postDelayed(runnable, 85L)
+        uiHandler.postDelayed(runnable, SUGGEST_DEBOUNCE_MS)
+    }
+
+    private fun loadNextSuggestionPage() {
+        if (suggestionLoading || !suggestionHasMore) return
+        val pager = suggestionPager ?: return
+        val generation = suggestGeneration.get()
+
+        suggestionLoading = true
+        executor.execute {
+            val page = runCatching { pager.next(SUGGEST_PAGE_SIZE) }.getOrDefault(emptyList())
+            val more = pager.hasMore()
+
+            runOnUiThread {
+                if (generation != suggestGeneration.get()) return@runOnUiThread
+                suggestionLoading = false
+                suggestionHasMore = more
+                if (page.isNotEmpty()) {
+                    suggestionItems.addAll(page)
+                    suggestionAdapter?.notifyDataSetChanged()
+                }
+            }
+        }
     }
 
     private fun ensureSuggestionPopup() {
-        if (suggestionPopup != null && suggestionContent != null && suggestionRows.size == 8) return
+        if (suggestionPopup != null && suggestionList != null && suggestionAdapter != null) return
 
         val panelBg = if (dark) Color.rgb(28, 30, 33) else Color.WHITE
         val fg = if (dark) Color.rgb(235, 235, 235) else Color.rgb(25, 25, 25)
         val divider = if (dark) Color.rgb(55, 57, 60) else Color.rgb(225, 225, 225)
 
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(panelBg)
-        }
-        suggestionRows.clear()
+        val adapter = object : BaseAdapter() {
+            override fun getCount(): Int = suggestionItems.size
+            override fun getItem(position: Int): String = suggestionItems[position]
+            override fun getItemId(position: Int): Long = position.toLong()
 
-        repeat(8) {
-            val row = TextView(this).apply {
-                textSize = 17f
-                setTextColor(fg)
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(14), 0, dp(14), 0)
-                setBackgroundColor(panelBg)
-                visibility = View.GONE
-                setOnClickListener {
-                    val word = text.toString()
-                    if (word.isNotBlank()) {
-                        hideSuggestions()
-                        lookup(word, recordHistory = true)
-                    }
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                val row = (convertView as? TextView) ?: TextView(this@DictionaryActivity).apply {
+                    textSize = 17f
+                    setTextColor(fg)
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(14), 0, dp(14), 0)
+                    minHeight = dp(42)
+                    setBackgroundColor(panelBg)
+                }
+                row.text = getItem(position)
+                return row
+            }
+        }
+
+        val list = ListView(this).apply {
+            this.adapter = adapter
+            setBackgroundColor(panelBg)
+            dividerHeight = 1
+            setDivider(ColorDrawable(divider))
+            isVerticalScrollBarEnabled = true
+
+            setOnItemClickListener { _, _, position, _ ->
+                val word = suggestionItems.getOrNull(position).orEmpty()
+                if (word.isNotBlank()) {
+                    hideSuggestions()
+                    lookup(word, recordHistory = true)
                 }
             }
-            suggestionRows += row
-            content.addView(
-                row,
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42))
-            )
-            content.addView(
-                View(this).apply { setBackgroundColor(divider) },
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
-            )
+
+            setOnScrollListener(object : AbsListView.OnScrollListener {
+                override fun onScrollStateChanged(view: AbsListView?, scrollState: Int) = Unit
+
+                override fun onScroll(
+                    view: AbsListView?,
+                    firstVisibleItem: Int,
+                    visibleItemCount: Int,
+                    totalItemCount: Int
+                ) {
+                    if (totalItemCount == 0) return
+                    val lastVisible = firstVisibleItem + visibleItemCount
+                    if (lastVisible >= totalItemCount - SUGGEST_PREFETCH_ROWS) {
+                        loadNextSuggestionPage()
+                    }
+                }
+            })
         }
 
-        suggestionContent = content
+        suggestionAdapter = adapter
+        suggestionList = list
         suggestionPopup = PopupWindow(
-            content,
+            list,
             ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
+            dp(42 * SUGGEST_VISIBLE_ROWS),
             false
         ).apply {
             isOutsideTouchable = true
@@ -546,33 +650,18 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun renderLiveSuggestions(list: List<String>) {
-        if (list.isEmpty()) {
-            hideSuggestions()
-            return
-        }
-
+    private fun renderSuggestionPopup() {
         ensureSuggestionPopup()
-        suggestionRows.forEachIndexed { index, row ->
-            val word = list.getOrNull(index)
-            if (word == null) {
-                row.visibility = View.GONE
-                row.text = ""
-            } else {
-                row.text = word
-                row.visibility = View.VISIBLE
-            }
-        }
-
         val width = (root.width - root.paddingLeft - root.paddingRight).coerceAtLeast(dp(220))
+        val height = dp(42 * SUGGEST_VISIBLE_ROWS)
         val popup = suggestionPopup ?: return
         popup.width = width
+        popup.height = height
 
         if (!popup.isShowing) {
             popup.showAsDropDown(queryBox, -dp(48), -dp(1))
         } else {
-            // Update the same popup in place: no dismiss/recreate flash between keystrokes.
-            popup.update(width, ViewGroup.LayoutParams.WRAP_CONTENT)
+            popup.update(width, height)
         }
     }
 
@@ -580,15 +669,19 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         suggestionRunnable?.let(uiHandler::removeCallbacks)
         suggestionRunnable = null
         suggestGeneration.incrementAndGet()
+        suggestionLoading = false
+        suggestionHasMore = false
+        suggestionPrefix = ""
+        suggestionPager = null
+        suggestionItems.clear()
+        suggestionAdapter?.notifyDataSetChanged()
         suggestionPopup?.dismiss()
     }
 
+    // ---------- selection / links ----------
 
     override fun onActionModeStarted(mode: ActionMode) {
         super.onActionModeStarted(mode)
-
-        // WebView does not expose TextView's customSelectionActionModeCallback API.
-        // Add our action as soon as Android reports the selection ActionMode.
         addDictionarySelectionAction(mode.menu)
 
         mode.menu.findItem(0x454E504C)?.setOnMenuItemClickListener {
@@ -605,8 +698,6 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun addDictionarySelectionAction(menu: Menu) {
         if (menu.findItem(0x454E504C) != null) return
-        // This callback runs while the toolbar is being built, rather than after it is shown.
-        // That gives our order=0 item the best chance to appear first in our own app.
         menu.add(Menu.NONE, 0x454E504C, 0, "EN-PL")
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS or MenuItem.SHOW_AS_ACTION_WITH_TEXT)
     }
@@ -683,39 +774,51 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         }
     }
 
+    // ---------- lookup ----------
+
     private fun lookup(raw: String, recordHistory: Boolean) {
         val active = catalog ?: return
         val q = cleanQuery(raw)
         if (q.isEmpty()) return
 
+        val deferred = deferInitialExternalPresentation && root.visibility != View.VISIBLE
+
         hideSuggestions()
-        setQueryText(q)
-        progress.visibility = View.VISIBLE
+        if (!deferred) {
+            setQueryText(q)
+            progress.visibility = View.VISIBLE
+        }
 
         executor.execute {
             try {
                 val results = active.lookup(q)
-                if (recordHistory) history.record(q)
 
                 if (results.isNotEmpty()) {
                     runOnUiThread {
-                        progress.visibility = View.GONE
                         currentWord = results.first().word
                         setQueryText(currentWord)
-                        renderResults(results)
+                        if (!deferred) progress.visibility = View.GONE
+                        renderResults(results, revealWhenReady = deferred)
                     }
                 } else {
                     val nearby = active.suggest(q, 24)
                     runOnUiThread {
-                        progress.visibility = View.GONE
                         currentWord = q
-                        renderSuggestions(q, nearby)
+                        setQueryText(q)
+                        if (!deferred) progress.visibility = View.GONE
+                        renderSuggestions(q, nearby, revealWhenReady = deferred)
                     }
                 }
+
+                // History persistence must never delay the first visible definition frame.
+                if (recordHistory) history.record(q)
             } catch (e: Exception) {
                 runOnUiThread {
                     progress.visibility = View.GONE
-                    showMessage("Read error: ${esc(e.message ?: e.javaClass.simpleName)}")
+                    showMessage(
+                        "Read error: ${esc(e.message ?: e.javaClass.simpleName)}",
+                        revealWhenReady = deferred
+                    )
                 }
             }
         }
@@ -737,7 +840,10 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
             "a{text-decoration:none;}"
     }
 
-    private fun renderResults(results: List<DictionaryCatalog.Result>) {
+    private fun renderResults(
+        results: List<DictionaryCatalog.Result>,
+        revealWhenReady: Boolean = false
+    ) {
         val body = buildString {
             for (result in results) {
                 append("<div class='dict'><div class='dict-title'>")
@@ -747,17 +853,22 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                 append("</div>")
             }
         }
-        renderEntry(body)
+        renderEntry(body, revealWhenReady)
     }
 
-    private fun renderEntry(body: String) {
+    private fun renderEntry(body: String, revealWhenReady: Boolean = false) {
+        if (revealWhenReady) revealAfterNextPage = true
         val page =
             "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>" +
                 "<style>${css()}</style></head><body>$body</body></html>"
         web.loadDataWithBaseURL("https://local.dictionary/", page, "text/html", "UTF-8", null)
     }
 
-    private fun renderSuggestions(q: String, list: List<String>) {
+    private fun renderSuggestions(
+        q: String,
+        list: List<String>,
+        revealWhenReady: Boolean = false
+    ) {
         val body = buildString {
             append("<B>No exact entry for ‘${esc(q)}’.</B><br><br>")
             if (list.isEmpty()) append("No prefix matches.")
@@ -768,18 +879,34 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
                 }
             }
         }
-        renderEntry(body)
+        renderEntry(body, revealWhenReady)
     }
 
-    private fun showMessage(msg: String) = renderEntry("<div>$msg</div>")
+    private fun showMessage(msg: String, revealWhenReady: Boolean = false) =
+        renderEntry("<div>$msg</div>", revealWhenReady)
 
     private fun esc(s: String): String = s.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace("\"", "&quot;")
 
+    // ---------- lazy TTS ----------
+
     private fun speak(locale: Locale) {
         if (currentWord.isBlank()) return
+        if (tts == null) {
+            pendingSpeakLocale = locale
+            tts = TextToSpeech(this, this)
+            return
+        }
+        if (!ttsReady) {
+            pendingSpeakLocale = locale
+            return
+        }
+        speakReady(locale)
+    }
+
+    private fun speakReady(locale: Locale) {
         val engine = tts ?: return
         val status = engine.setLanguage(locale)
         if (status == TextToSpeech.LANG_MISSING_DATA ||
@@ -795,7 +922,13 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         engine.speak(currentWord, TextToSpeech.QUEUE_FLUSH, null, "word")
     }
 
-    override fun onInit(status: Int) = Unit
+    override fun onInit(status: Int) {
+        ttsReady = status == TextToSpeech.SUCCESS
+        if (!ttsReady) return
+        val locale = pendingSpeakLocale ?: return
+        pendingSpeakLocale = null
+        speakReady(locale)
+    }
 
     override fun onDestroy() {
         super.onDestroy()
@@ -803,12 +936,18 @@ abstract class DictionaryActivity : Activity(), TextToSpeech.OnInitListener {
         suggestionRunnable = null
         suggestionPopup?.dismiss()
         suggestionPopup = null
-        suggestionContent = null
-        suggestionRows.clear()
+        suggestionList = null
+        suggestionAdapter = null
+        suggestionPager = null
+        suggestionItems.clear()
+
         catalog?.close()
         catalog = null
+
         tts?.stop()
         tts?.shutdown()
+        tts = null
+
         history.close()
         executor.shutdownNow()
     }
